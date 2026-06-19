@@ -1,0 +1,44 @@
+# Smart Home Hub
+
+A smart home automation system built using the PIC16F877A microcontroller.
+
+## How It Works
+
+The PIC16F877A acts as the main controller of the system. It continuously reads data from multiple sensors and performs actions based on the detected conditions.
+
+* The **LM35** monitors temperature.
+* The **MQ2** detects gas or smoke.
+* The **PIR sensor** detects motion.
+* The **LDR** measures ambient light.
+
+The sensor values are processed by the microcontroller and displayed on a **16x2 LCD**.
+
+The system can be controlled manually using a push button or wirelessly through an **HC-05 Bluetooth module**.
+
+A **DS3231 RTC** provides real-time date and time information, while an **SG90 servo motor** simulates a smart door system. A buzzer is activated when alarm conditions are detected.
+
+## Technologies Used
+
+* PIC16F877A
+* Embedded C
+* MPLAB X IDE
+* XC8 Compiler
+* Proteus Simulation
+
+## Features
+
+* Temperature Monitoring
+* Gas Detection
+* Motion Detection
+* Automatic Lighting
+* Bluetooth Control
+* Real-Time Clock
+* Smart Door Control
+* LCD Status Display
+* Alarm System
+
+A smart home automation system built using the PIC16F877A microcontroller.
+
+The system monitors temperature, gas, motion, and light levels using multiple sensors. Based on the sensor readings, the microcontroller can activate alarms, control lighting, display system information on an LCD, and allow manual or Bluetooth-based control.
+
+The project integrates ADC, UART, I2C, and PWM peripherals to provide monitoring, communication, and automation functions.
