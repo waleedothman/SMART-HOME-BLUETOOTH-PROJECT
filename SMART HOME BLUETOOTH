@@ -1,0 +1,750 @@
+#include <xc.h>
+
+// ================= CONFIGURATION BITS =================
+// these are just the chip settings, copy-pasted from datasheet/MPLAB wizard
+#pragma config FOSC = HS     // using high speed crystal (20MHz)
+#pragma config WDTE = OFF    // watchdog timer off, dont need it
+#pragma config PWRTE = ON    // power up timer on, helps with stable boot
+#pragma config BOREN = OFF   // brown out reset off
+#pragma config LVP  = OFF    // low voltage programming off
+#pragma config CPD  = OFF    // no data eeprom protection
+#pragma config WRT   = OFF   // no flash write protection
+#pragma config CP    = OFF   // no code protection
+
+#define _XTAL_FREQ 20000000  // needed for __delay_ms() to work right
+#define RTC_ADDR   0x68      // i2c address of the DS1307 RTC module
+
+// ================= THRESHOLDS =================
+// just tuned these by testing, change if sensor is too sensitive
+#define GAS_THRESHOLD       300
+#define TEMP_THRESHOLD_C     40
+#define LDR_THRESHOLD       600
+#define LM35_MIN_RAW         10   // below this = sensor probably not connected
+#define LM35_MAX_RAW        409
+
+// PIR: require 3 consecutive HIGH reads before triggering,
+// then hold motionDetected ON for 150 Read_PIR() calls after last HIGH.
+#define PIR_CONFIRM_COUNT     3
+#define PIR_HOLD_LOOPS      1000
+
+#define BUZZ_CYCLES           5
+
+// ================= LCD PINS =================
+// 16x2 LCD in 4-bit mode, wired to PORTD
+#define RS PORTDbits.RD0
+#define E  PORTDbits.RD2
+#define D4 PORTDbits.RD4
+#define D5 PORTDbits.RD5
+#define D6 PORTDbits.RD6
+#define D7 PORTDbits.RD7
+
+// ================= BUTTON PIN =================
+#define BUTTON PORTBbits.RB5  // manual door open/close button
+
+// ================= SERVO SETTINGS =================
+// pulse width in microseconds for servo angles (standard servo range)
+#define SERVO_CLOSE_US      1000
+#define SERVO_OPEN_US       2000
+#define SERVO_STEP_US        25   // move servo in small steps so its not jerky
+#define SERVO_STEP_DELAY_MS  10
+
+// ================= GLOBALS =================
+unsigned char sec, minute, hour, date, month, year;  // current time/date from RTC
+unsigned int  tempRaw, gasRaw, ldrRaw;                 // raw ADC values
+unsigned int  tempC;                                   // temp converted to celsius
+
+unsigned char gasAlert       = 0;
+unsigned char tempAlert      = 0;
+unsigned char motionDetected = 0;
+unsigned char darkDetected   = 0;
+unsigned char alarmLatched   = 0;  // stays 1 while buzzer is doing its beep cycles
+unsigned int  buzzCounter    = 0;
+
+// PIR debounce & hold
+unsigned char pirConfirm     = 0;  // counts consecutive HIGH reads
+unsigned int  pirHoldTimer   = 0;  // keeps motion "on" for a while after last trigger
+
+unsigned char doorOpen       = 0;
+
+// ledMode: 0=AUTO (follows sensors), 1=FORCE ON, 2=FORCE OFF
+unsigned char ledBoost = 0;        // set by BT command to force LED on temporarily
+unsigned int  ledBoostTimer = 0;
+
+unsigned int  current_servo_us = SERVO_CLOSE_US;  // tracks servo position for smooth move
+volatile unsigned char received_cmd = 0;  // last byte received from bluetooth (set in ISR)
+volatile unsigned char newCmd = 0;        // flag: 1 = new command waiting to be handled
+
+// ================= FORWARD DECLARATIONS =================
+void Door_Open(void);
+void Door_Close(void);
+void RTC_Read(void);
+void BT_Send_Status(void);
+void BT_Send_Menu(void);
+void BT_Handle_Cmd(unsigned char cmd);
+void Check_Button(void);
+void Read_PIR(void);
+void Apply_LED(void);
+
+// ================= LCD =================
+void pulse_EN(void) { E=1; __delay_ms(2); E=0; __delay_ms(2); }  // toggle enable pin so LCD reads the data
+
+void send_nibble(unsigned char n)
+{
+    // send 4 bits at a time (4-bit mode)
+    D4=(n>>0)&1; D5=(n>>1)&1; D6=(n>>2)&1; D7=(n>>3)&1;
+    pulse_EN();
+}
+
+void lcd_cmd(unsigned char cmd)
+{
+    // RS=0 means this is a command, not data. send high nibble then low nibble
+    RS=0; send_nibble(cmd>>4); send_nibble(cmd&0x0F); __delay_ms(5);
+}
+
+void lcd_data(unsigned char dat)
+{
+    // RS=1 means this is actual character data to display
+    RS=1; send_nibble(dat>>4); send_nibble(dat&0x0F); __delay_ms(2);
+}
+
+void lcd_init(void)
+{
+    // standard 4-bit LCD init sequence from datasheet
+    TRISD=0x00; PORTD=0x00; __delay_ms(100); RS=0;
+    send_nibble(0x03); __delay_ms(5);
+    send_nibble(0x03); __delay_ms(5);
+    send_nibble(0x03); __delay_ms(5);
+    send_nibble(0x02);  // switch to 4-bit mode
+    lcd_cmd(0x28); lcd_cmd(0x0C); lcd_cmd(0x06); lcd_cmd(0x01); __delay_ms(5);
+}
+
+void lcd_set_cursor(unsigned char row, unsigned char col)
+{
+    // row 1 or row 2, col starts at 1
+    if(row==1) lcd_cmd(0x80+col-1);
+    else       lcd_cmd(0xC0+col-1);
+}
+
+void lcd_print(const char *s)         { while(*s){ lcd_data(*s); s++; } }  // print whole string
+void lcd_print_digit(unsigned char v) { lcd_data((v/10)+'0'); lcd_data((v%10)+'0'); }  // always 2 digits, for time/date
+
+void lcd_print_uint(unsigned int val)
+{
+    // converts number to string and prints it (no built in itoa so doing manually)
+    char buf[6]; unsigned char i=0;
+    if(val==0){ lcd_data('0'); return; }
+    while(val>0&&i<5){ buf[i++]=(val%10)+'0'; val/=10; }
+    while(i>0) lcd_data(buf[--i]);  // print in reverse order since we built it backwards
+}
+
+// ================= SOFTWARE I2C =================
+// bit-banged i2c since not using hardware MSSP module here
+#define SCL_LOW()     do{ TRISCbits.TRISC3=0; PORTCbits.RC3=0; }while(0)
+#define SCL_RELEASE() do{ TRISCbits.TRISC3=1; }while(0)
+#define SDA_LOW()     do{ TRISCbits.TRISC4=0; PORTCbits.RC4=0; }while(0)
+#define SDA_RELEASE() do{ TRISCbits.TRISC4=1; }while(0)
+#define SDA_READ()    PORTCbits.RC4
+
+void I2C_Delay(void) { __delay_us(10); }
+void I2C_Init(void)  { SDA_RELEASE(); SCL_RELEASE(); __delay_ms(10); }
+
+void I2C_Start(void)
+{
+    // start condition: SDA goes low while SCL is high
+    SDA_RELEASE(); SCL_RELEASE(); I2C_Delay();
+    SDA_LOW(); I2C_Delay(); SCL_LOW(); I2C_Delay();
+}
+
+void I2C_Stop(void)
+{
+    // stop condition: SDA goes high while SCL is high
+    SDA_LOW(); I2C_Delay(); SCL_RELEASE(); I2C_Delay(); SDA_RELEASE(); I2C_Delay();
+}
+
+void I2C_Repeated_Start(void)
+{
+    SDA_RELEASE(); I2C_Delay(); SCL_RELEASE(); I2C_Delay();
+    SDA_LOW(); I2C_Delay(); SCL_LOW(); I2C_Delay();
+}
+
+unsigned char I2C_Write_Byte(unsigned char data)
+{
+    // shifts out 8 bits MSB first, then checks for ack from slave
+    unsigned char i, ack;
+    for(i=0;i<8;i++){
+        if(data&0x80) SDA_RELEASE(); else SDA_LOW();
+        I2C_Delay(); SCL_RELEASE(); I2C_Delay(); SCL_LOW(); I2C_Delay();
+        data<<=1;
+    }
+    SDA_RELEASE(); I2C_Delay(); SCL_RELEASE(); I2C_Delay();
+    ack=SDA_READ(); SCL_LOW(); I2C_Delay();
+    return ack;
+}
+
+unsigned char I2C_Read_Byte(unsigned char sendAck)
+{
+    // reads 8 bits in, then sends ack/nack depending on if more bytes needed
+    unsigned char i, data=0;
+    SDA_RELEASE();
+    for(i=0;i<8;i++){
+        data<<=1; SCL_RELEASE(); I2C_Delay();
+        if(SDA_READ()) data|=1;
+        SCL_LOW(); I2C_Delay();
+    }
+    if(sendAck) SDA_LOW(); else SDA_RELEASE();
+    I2C_Delay(); SCL_RELEASE(); I2C_Delay(); SCL_LOW(); I2C_Delay();
+    SDA_RELEASE();
+    return data;
+}
+
+// ================= BCD =================
+// RTC stores time in BCD format not normal binary, so need to convert
+unsigned char Dec_To_BCD(unsigned char d){ return ((d/10)<<4)|(d%10); }
+unsigned char BCD_To_Dec(unsigned char b){ return ((b>>4)*10)+(b&0x0F); }
+
+// ================= RTC =================
+void RTC_Set(unsigned char hh, unsigned char mm, unsigned char ss,
+             unsigned char dd, unsigned char mo, unsigned char yy)
+{
+    // writes time to DS1307 registers starting at address 0x00
+    I2C_Start();
+    I2C_Write_Byte(RTC_ADDR<<1); I2C_Write_Byte(0x00);
+    I2C_Write_Byte(Dec_To_BCD(ss)&0x7F);  // bit7=0 to make sure clock is running
+    I2C_Write_Byte(Dec_To_BCD(mm));
+    I2C_Write_Byte(Dec_To_BCD(hh)&0x3F);  // bit6=0 for 24hr mode
+    I2C_Write_Byte(0x01);   // day of week, not really using this
+    I2C_Write_Byte(Dec_To_BCD(dd));
+    I2C_Write_Byte(Dec_To_BCD(mo));
+    I2C_Write_Byte(Dec_To_BCD(yy));
+    I2C_Stop(); __delay_ms(50);
+}
+
+void RTC_Read(void)
+{
+    // point to register 0, then read 7 bytes back (sec,min,hour,dow,date,month,year)
+    I2C_Start();
+    I2C_Write_Byte(RTC_ADDR<<1); I2C_Write_Byte(0x00);
+    I2C_Repeated_Start();
+    I2C_Write_Byte((RTC_ADDR<<1)|1);
+    sec    = BCD_To_Dec(I2C_Read_Byte(1)&0x7F);
+    minute = BCD_To_Dec(I2C_Read_Byte(1));
+    hour   = BCD_To_Dec(I2C_Read_Byte(1)&0x3F);
+    I2C_Read_Byte(1);   // skip day of week byte, dont need it
+    date   = BCD_To_Dec(I2C_Read_Byte(1));
+    month  = BCD_To_Dec(I2C_Read_Byte(1));
+    year   = BCD_To_Dec(I2C_Read_Byte(0));  // last byte, send NACK (0) to end read
+    I2C_Stop();
+}
+
+// ================= ADC =================
+void ADC_Init(void)
+{
+    // STEP 1: Reset all ports to digital (makes RE0 work as digital PIR input)
+    ADCON1 = 0x07;
+    TRISEbits.TRISE0 = 1;   // RE0 = PIR input (digital)
+    __delay_ms(10);
+
+    // STEP 2: Re-enable only AN0, AN1, AN2 as analog for sensors
+    ADCON1 = 0x82;           // right-justified, AN0/AN1/AN2 analog, RE0 stays digital
+    ADCON0 = 0x81;           // ADC ON, channel 0
+    TRISA  = 0xFF;           // All PORTA as input
+    TRISBbits.TRISB0 = 0;   // RB0 = buzzer output
+    TRISBbits.TRISB1 = 0;   // RB1 = LED output
+    TRISBbits.TRISB2 = 0;   // RB2 = spare
+    PORTB  = 0x00;
+}
+
+unsigned int ADC_Read(unsigned char channel)
+{
+    // select channel, wait a bit for it to settle, start conversion, wait till done
+    ADCON0 &= 0b11000101;
+    ADCON0 |= (channel<<3);
+    __delay_ms(5);
+    GO_nDONE=1; while(GO_nDONE);  // wait for conversion to finish
+    return ((unsigned int)(ADRESH<<8)+ADRESL);  // combine high+low byte into 10-bit result
+}
+
+// ================= UART =================
+void UART_Init(void)
+{
+    TRISCbits.TRISC6 = 0;  // TX pin = output
+    TRISCbits.TRISC7 = 1;  // RX pin = input
+    SPBRG  = 129;           // baud rate setting for 9600 @ 20MHz
+    TXSTA  = 0x24;          // TX enabled, high speed baud
+    RCSTA  = 0x90;          // serial port enabled, continuous receive
+    SPBRG  = 129;
+
+
+    PIE1bits.RCIE = 1;     // enable RX interrupt so we catch BT commands instantly
+    INTCONbits.PEIE = 1;   // enable peripheral interrupts
+    INTCONbits.GIE  = 1;   // enable global interrupts
+    
+    __delay_ms(100);
+}
+
+void UART_Send_Char(unsigned char c)
+{
+    while(!TXSTAbits.TRMT);  // wait till transmit buffer is empty
+    TXREG = c;
+}
+
+void UART_Send_String(const char *s) { while(*s){ UART_Send_Char(*s); s++; } }
+
+void UART_Send_Num(unsigned int val)
+{
+    // same trick as lcd_print_uint, build digits backwards then print in order
+    char buf[6]; unsigned char i=0;
+    if(val==0){ UART_Send_Char('0'); return; }
+    while(val>0&&i<5){ buf[i++]=(val%10)+'0'; val/=10; }
+    while(i>0) UART_Send_Char(buf[--i]);
+}
+
+unsigned char UART_Read_If_Available(void)
+{
+    // check for overrun error first or UART can lock up
+    if(RCSTAbits.OERR){
+        RCSTAbits.CREN = 0;
+        RCSTAbits.CREN = 1;
+        return 0;
+    }
+    if(PIR1bits.RCIF) return RCREG;  // got a byte, return it
+    return 0;  // nothing waiting
+}
+
+void UART_Flush(void)
+{
+    // clears out any leftover bytes so old commands dont get reprocessed
+    unsigned char dummy;
+    while(!TXSTAbits.TRMT);
+    __delay_ms(5);
+    while(PIR1bits.RCIF){ dummy=RCREG; (void)dummy; }
+}
+
+// ================= APPLY LED STATE =================
+void Apply_LED(void)
+{
+    // LED turns on automatically if its dark or motion detected
+    unsigned char sensorLED = (motionDetected || darkDetected);
+
+    // unless boost mode is active, then force it on regardless
+    if(ledBoost && ledBoostTimer > 0)
+        PORTBbits.RB1 = 1;
+    else
+        PORTBbits.RB1 = sensorLED;
+}
+
+void LED_Service(void)
+{
+    // counts down the boost timer, turns boost off when it hits 0
+    if(ledBoostTimer > 0)
+        ledBoostTimer--;
+    else
+        ledBoost = 0;
+
+    Apply_LED();
+}
+
+// ================= READ PIR =================
+// FIX 1: Requires PIR_CONFIRM_COUNT consecutive HIGH reads before triggering.
+// FIX 2: Holds motionDetected ON for PIR_HOLD_LOOPS cycles after last HIGH,
+//         so brief LOW glitches between PIR pulses do NOT clear the detection.
+void Read_PIR(void)
+{
+    if(PORTEbits.RE0 == 1)
+    {
+        // PIR is HIGH, count it up (debounce so random noise doesnt trigger it)
+        if(pirConfirm < PIR_CONFIRM_COUNT)
+            pirConfirm++;
+
+        if(pirConfirm >= PIR_CONFIRM_COUNT)
+        {
+            motionDetected = 1;
+            pirHoldTimer   = PIR_HOLD_LOOPS;   // reset hold timer every time we see HIGH
+        }
+    }
+    else
+    {
+        // PIR went LOW, reset the confirm counter right away
+        pirConfirm = 0;
+
+        // but dont clear motion yet, count down the hold first
+        // this stops the display from flickering between pulses
+        if(pirHoldTimer > 0)
+            pirHoldTimer--;
+        else
+            motionDetected = 0;
+    }
+}
+
+// ================= BLUETOOTH =================
+void BT_Send_Menu(void)
+{
+    // just prints out the command list over bluetooth so user knows what to send
+    UART_Send_String("\r\n=== SMART HOME MENU ===\r\n");
+    UART_Send_String("  1 = Buzzer ON\r\n");
+    UART_Send_String("  2 = Buzzer OFF\r\n");
+    UART_Send_String("  3 = Door OPEN\r\n");
+    UART_Send_String("  4 = Door CLOSE\r\n");
+    UART_Send_String("  5 = Status Report\r\n");
+    UART_Send_String("  6 = LED ON\r\n");
+    UART_Send_String("  7 = LED OFF\r\n");
+    UART_Send_String("  0 = Show this menu\r\n");
+    UART_Send_String("=======================\r\n");
+}
+
+void BT_Send_Status(void)
+{
+    // dumps all sensor + system info as text, used by command 5
+    UART_Send_String("\r\n=== STATUS REPORT ===\r\n");
+    UART_Send_String("TIME  : ");
+    UART_Send_Num(hour);   UART_Send_Char(':');
+    UART_Send_Num(minute); UART_Send_Char(':');
+    UART_Send_Num(sec);    UART_Send_String("\r\n");
+    UART_Send_String("DATE  : ");
+    UART_Send_Num(date);  UART_Send_Char('/');
+    UART_Send_Num(month); UART_Send_Char('/');
+    UART_Send_Num(year);  UART_Send_String("\r\n");
+    UART_Send_String("TEMP  : ");
+    if(tempRaw<LM35_MIN_RAW || tempRaw>LM35_MAX_RAW) UART_Send_String("N/A");  // sensor probably unplugged
+    else{ UART_Send_Num(tempC); UART_Send_Char('C'); }
+    UART_Send_String("\r\n");
+    UART_Send_String("GAS   : ");
+    UART_Send_Num(gasRaw);
+    UART_Send_String(gasAlert ? " [ALERT]\r\n" : " [OK]\r\n");
+    UART_Send_String("PIR   : ");
+    UART_Send_String(motionDetected ? "DETECTED\r\n" : "CLEAR\r\n");
+    UART_Send_String("LIGHT : ");
+    UART_Send_String(darkDetected ? "DARK\r\n" : "BRIGHT\r\n");
+    UART_Send_String("LED   : ");
+    UART_Send_String(PORTBbits.RB1 ? "ON\r\n" : "OFF\r\n");
+    UART_Send_String("DOOR  : ");
+    UART_Send_String(doorOpen ? "OPEN\r\n" : "CLOSED\r\n");
+    UART_Send_String("BUZZER: ");
+    UART_Send_String(PORTBbits.RB0 ? "ON\r\n" : "OFF\r\n");
+    UART_Send_String("ALARM : ");
+    if(gasAlert && tempAlert)  UART_Send_String("GAS+TEMP\r\n");
+    else if(gasAlert)          UART_Send_String("GAS\r\n");
+    else if(tempAlert)         UART_Send_String("TEMP\r\n");
+    else                       UART_Send_String("NONE\r\n");
+    UART_Send_String("=====================\r\n");
+}
+
+void BT_Handle_Cmd(unsigned char cmd)
+{
+    // simple switch-like check, one char command from phone app
+    if     (cmd=='1'){ PORTBbits.RB0=1; UART_Send_String("BUZZER: ON\r\n"); }
+    else if(cmd=='2'){ PORTBbits.RB0=0; UART_Send_String("BUZZER: OFF\r\n"); }
+    else if(cmd=='3'){ Door_Open(); }
+    else if(cmd=='4'){ Door_Close(); }
+    else if(cmd=='5'){ RTC_Read(); BT_Send_Status(); }
+    else if(cmd=='6')
+{
+    // force LED on for 3 sec, useful if you want light without waiting on sensors
+    ledBoost = 1;
+    ledBoostTimer = 3000;   // 3 seconds
+    Apply_LED();
+    UART_Send_String("LED BOOST ON\r\n");
+}
+else if(cmd=='7')
+{
+    // cancel the boost, go back to auto LED control
+    ledBoost = 0;
+    ledBoostTimer = 0;
+    Apply_LED();
+    UART_Send_String("LED BOOST OFF\r\n");
+}   
+    else if(cmd=='0'){ BT_Send_Menu(); }
+    else if(cmd=='\r' || cmd=='\n' || cmd==' '){ return; }  // ignore enter/space, dont spam unknown cmd msg
+    else { UART_Send_String("? Unknown. Send 0 for menu\r\n"); }
+    UART_Flush();
+}
+
+// ================= DELAY WITH BT POLLING =================
+// FIX: Read_PIR() is now called every 1ms here, so PIR is always fresh
+// during ALL screen delays ? not just Screen 1.
+void delay_with_bt(unsigned int ms)
+{
+    // basically a replacement for __delay_ms() that doesnt block everything else
+    // checks bluetooth, button, and PIR every single millisecond
+    unsigned int i;
+    unsigned char cmd;
+    for(i=0; i<ms; i++){
+        cmd = UART_Read_If_Available();
+        if(cmd) BT_Handle_Cmd(cmd);
+        Check_Button();
+        Read_PIR();        // <-- FIX: PIR sampled every 1ms during all screens
+        Apply_LED();
+        __delay_ms(1);
+    }
+}
+
+// ================= SERVO =================
+void Servo_Init(void)
+{
+    // sets up CCP1 module for PWM on RC2, used to drive servo
+    TRISCbits.TRISC2 = 0;
+    PR2     = 155;     // sets PWM period (~20ms for servo, matches timer2 prescaler)
+    T2CON   = 0x07;    // timer2 on, prescaler 16
+    CCP1CON = 0x00;    // PWM off until we actually move servo
+    PORTCbits.RC2 = 0;
+}
+
+void set_servo_us(unsigned int us)
+{
+    // converts microseconds pulse width into the duty cycle value CCP needs
+    unsigned int duty;
+    CCP1CON = 0x0C;   // PWM mode on
+    duty = (unsigned int)((unsigned long)us * 5 / 64);
+    if(duty > 255) duty = 255;  // clamp so it doesnt overflow the register
+    CCPR1L = (unsigned char)duty;
+}
+
+void stop_servo(void)
+{
+    // turns off PWM so servo doesnt jitter/hum when not moving
+    CCP1CON = 0x00;
+    PORTCbits.RC2 = 0;
+}
+
+void move_smooth_us(unsigned int target_us)
+{
+    // moves servo gradually instead of snapping straight to target
+    // this is gentler on the gears and looks way better
+    unsigned char i;
+    unsigned char cmd;
+
+    while(current_servo_us != target_us)
+    {
+        if(current_servo_us < target_us){
+            if((target_us - current_servo_us) < SERVO_STEP_US)
+                current_servo_us = target_us;
+            else
+                current_servo_us += SERVO_STEP_US;
+        } else {
+            if((current_servo_us - target_us) < SERVO_STEP_US)
+                current_servo_us = target_us;
+            else
+                current_servo_us -= SERVO_STEP_US;
+        }
+
+        set_servo_us(current_servo_us);
+
+        // keep checking BT/PIR even while servo is mid-move so nothing freezes
+        for(i=0; i<SERVO_STEP_DELAY_MS; i++)
+        {
+            cmd = UART_Read_If_Available();
+            if(cmd=='1'){ PORTBbits.RB0=1; }
+            else if(cmd=='2'){ PORTBbits.RB0=0; }
+            else if(cmd=='5'){ RTC_Read(); BT_Send_Status(); }
+            else if(cmd=='0'){ BT_Send_Menu(); }
+
+            Read_PIR();    // <-- FIX: also poll PIR during servo movement
+            Apply_LED();
+            __delay_ms(1);
+        }
+    }
+
+    __delay_ms(150);  // let servo settle before cutting power
+    stop_servo();
+}
+
+void Door_Open(void)
+{
+    move_smooth_us(SERVO_OPEN_US);
+    doorOpen = 1;
+    UART_Send_String("DOOR: OPENED\r\n");
+}
+
+void Door_Close(void)
+{
+    move_smooth_us(SERVO_CLOSE_US);
+    doorOpen = 0;
+    UART_Send_String("DOOR: CLOSED\r\n");
+}
+
+// ================= BUTTON =================
+void Check_Button(void)
+{
+    // basic debounce: check twice with a small delay between, then wait for release
+    if(BUTTON == 0){
+        __delay_ms(30);
+        if(BUTTON == 0){
+            while(BUTTON == 0);   // wait here until button is let go
+            __delay_ms(50);
+            if(doorOpen == 0) Door_Open();
+            else              Door_Close();
+        }
+    }
+}
+
+void __interrupt() ISR(void)
+{
+    // fires whenever a byte comes in over UART, grab it and set the flag
+    // keeping this short on purpose, actual command handling happens in main loop
+    if(PIR1bits.RCIF)   // UART receive interrupt
+    {
+        received_cmd = RCREG;
+        newCmd = 1;
+    }
+}
+
+// ================= MAIN =================
+void main(void)
+{
+    // --- setup everything first ---
+    lcd_init();
+    I2C_Init();
+    ADC_Init();     // ADCON1=0x07 then 0x82 ? RE0 stays digital for PIR
+    UART_Init();
+    Servo_Init();
+
+    TRISBbits.TRISB5 = 1;       // button pin as input
+    OPTION_REGbits.nRBPU = 0;   // enable internal pull-ups on PORTB
+
+    // splash screen on boot
+    lcd_cmd(0x01);
+    lcd_set_cursor(1,1); lcd_print("SMART HOME HUB");
+    lcd_set_cursor(2,1); lcd_print("STARTING...");
+    __delay_ms(3000);
+    lcd_cmd(0x01);
+
+    // make sure door starts in known closed position
+    set_servo_us(SERVO_CLOSE_US);
+    __delay_ms(500);
+    stop_servo();
+    doorOpen = 0;
+    current_servo_us = SERVO_CLOSE_US;
+
+    UART_Send_String("\r\nSMART HOME READY\r\n");
+    BT_Send_Menu();
+
+    // ---- Uncomment ONCE to set time, then re-comment and reflash ----
+    // RTC_Set(6, 24, 0, 19, 5, 26);
+    // -----------------------------------------------------------------
+
+    while(1)
+    {
+        Check_Button();
+
+        // handle any bluetooth command that came in via interrupt
+        {
+            if(newCmd)
+    {
+    BT_Handle_Cmd(received_cmd);
+    newCmd = 0;
+    }
+        }
+
+        // ===== READ SENSORS =====
+        // average 8 readings of temp sensor to smooth out noise
+        {
+            unsigned long sum=0; unsigned char k;
+            for(k=0;k<8;k++) sum+=ADC_Read(0);
+            tempRaw=(unsigned int)(sum/8);
+        }
+
+        // convert raw ADC value to actual celsius (LM35 = 10mV per degree)
+        if(tempRaw>=LM35_MIN_RAW && tempRaw<=LM35_MAX_RAW)
+            tempC=(unsigned int)(((unsigned long)tempRaw*500UL)/1023UL);
+        else
+            tempC=0;   // out of range = treat as invalid reading
+
+        gasRaw = ADC_Read(1);
+        ldrRaw = ADC_Read(2);
+
+        // ===== READ PIR =====
+        // Called here AND inside delay_with_bt() and move_smooth_us()
+        // so it is always up to date regardless of which screen is active.
+        Read_PIR();
+
+        darkDetected = (ldrRaw > LDR_THRESHOLD);
+
+        // ===== UPDATE LED =====
+        Apply_LED();
+
+        // ===== ALERTS =====
+        gasAlert  = (gasRaw > GAS_THRESHOLD);
+        tempAlert = (tempC  > TEMP_THRESHOLD_C);
+
+        // ===== BUZZER =====
+        // start the alarm once, then let it beep for a fixed number of cycles
+        if((gasAlert||tempAlert) && !alarmLatched){
+            alarmLatched=1; buzzCounter=BUZZ_CYCLES; PORTBbits.RB0=1;
+            UART_Send_String("!! ALARM TRIGGERED\r\n");
+        }
+        if(alarmLatched && buzzCounter>0){
+            buzzCounter--;
+            if(buzzCounter==0) PORTBbits.RB0=0;
+        }
+        // reset alarm once the danger is gone and buzzer cycle finished
+        if(!gasAlert && !tempAlert && buzzCounter==0){ alarmLatched=0; PORTBbits.RB0=0; }
+
+        // ===== SCREEN 1: TIME =====
+        // shows live clock, updates twice per loop (1 sec total) so it doesnt look frozen
+        lcd_cmd(0x01);
+        lcd_set_cursor(1,1); lcd_print("TIME: --:--:--");
+        lcd_set_cursor(2,1); lcd_print("DATE: ");
+        RTC_Read();
+        lcd_print_digit(date);  lcd_data('/');
+        lcd_print_digit(month); lcd_data('/');
+        lcd_print_digit(year);
+        {
+            unsigned char i;
+            for(i=0;i<2;i++){
+                Check_Button();
+                Read_PIR();
+                Apply_LED();
+                RTC_Read();
+                lcd_set_cursor(1,7);
+                lcd_print_digit(hour);   lcd_data(':');
+                lcd_print_digit(minute); lcd_data(':');
+                lcd_print_digit(sec);
+                delay_with_bt(500);
+            }
+        }
+
+        // ===== SCREEN 2: TEMP / GAS =====
+        lcd_cmd(0x01);
+        lcd_set_cursor(1,1); lcd_print("TEMP: ");
+        if(tempRaw<LM35_MIN_RAW || tempRaw>LM35_MAX_RAW) lcd_print("N/A   ");
+        else{ lcd_print_uint(tempC); lcd_data('C'); lcd_print("   "); }
+        lcd_set_cursor(2,1); lcd_print("GAS:");
+        lcd_print_uint(gasRaw); lcd_print(" ");
+        if(gasAlert) lcd_print("ALT");
+        else         lcd_print("OK ");
+        delay_with_bt(1000);
+
+        // ===== SCREEN 3: PIR / LDR =====
+        lcd_cmd(0x01);
+        lcd_set_cursor(1,1); lcd_print("MOTION: ");
+        if(motionDetected) lcd_print("DETECT");
+        else               lcd_print("NONE  ");
+        lcd_set_cursor(2,1); lcd_print("LIGHT: ");
+        if(darkDetected)   lcd_print("DARK  ");
+        else               lcd_print("BRIGHT");
+        delay_with_bt(1000);
+
+        // ===== SCREEN 4: ALARM / DOOR =====
+        lcd_cmd(0x01);
+        lcd_set_cursor(1,1); lcd_print("ALARM: ");
+        if(gasAlert && tempAlert) lcd_print("BOTH  ");
+        else if(gasAlert)         lcd_print("GAS   ");
+        else if(tempAlert)        lcd_print("TEMP  ");
+        else                      lcd_print("OFF   ");
+        lcd_set_cursor(2,1); lcd_print("DOOR: ");
+        if(doorOpen) lcd_print("OPEN  ");
+        else         lcd_print("CLOSED");
+        delay_with_bt(1000);
+
+        // ===== SCREEN 5: SUMMARY =====
+        lcd_cmd(0x01);
+        lcd_set_cursor(1,1); lcd_print("SYS: ");
+        if(gasAlert || tempAlert) lcd_print("ALERT");
+        else                      lcd_print("OK   ");
+        lcd_set_cursor(2,1); lcd_print("LED: ");
+        if(PORTBbits.RB1) lcd_print("ON ");
+        else              lcd_print("OFF");
+        delay_with_bt(1000);
+        // loop goes back to top and repeats forever, cycling through all 5 screens
+    }
+}
